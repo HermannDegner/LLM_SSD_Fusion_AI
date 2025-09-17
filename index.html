@@ -1,0 +1,18 @@
+<!doctype html>
+<html><body>
+<h3>SSD Chat (API)</h3>
+<input id="msg" placeholder="message" style="width:60%"/>
+<button onclick="send()">Send</button>
+<pre id="log"></pre>
+<script>
+async function send(){
+  const text = document.getElementById('msg').value;
+  const res = await fetch('/generate', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({text})
+  });
+  const data = await res.json();
+  document.getElementById('log').textContent += "You: "+text+"\nAI: "+data.text+"\n\n";
+}
+</script>
+</body></html>
