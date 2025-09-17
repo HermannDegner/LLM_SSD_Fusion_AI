@@ -1,16 +1,16 @@
 """
-SSD-LLM Integration (Improved Version)
+SSD-LLM Integration (Fixed & GPU-ready)
 
-変更点:
-- DLL の追加関数 (ssd_get_params / ssd_set_params / ssd_get_N) バインディング
-- softmax/指数安定化に対応する C++ パッチ前提
-- GPU 未使用時は float32 / CPU へ移行
-- ノード範囲安全化
-- ジャンプ確率 p_jump を Python メタデータに追加 (p_jump = 1 - exp(-h*dt))
-- fetch_ssd_params / apply_ssd_params を追加
-- エラーハンドリング・ログ改善
+- DLL バインディング（ssd_get_params / ssd_set_params / ssd_get_N）を維持
+- 4090向け：単一GPUに明示配置（bf16既定）
+- tokenizer.pad_token を未定義モデルで補完
+- 生成設定（min_new_tokens / no_repeat_ngram_size / repetition_penalty）で反復抑制
+- インデント不整合を修正
 """
 
+
+from threading import Thread
+from transformers import TextIteratorStreamer
 import ctypes
 import os
 import time
@@ -85,7 +85,7 @@ class SSDCoreDLL:
             raise FileNotFoundError(f"DLL not found: {dll_path}")
         self.dll = ctypes.CDLL(dll_path)
 
-        # Bind core functions
+        # Core
         self.dll.ssd_create.argtypes = [ctypes.c_int32, ctypes.POINTER(SSDParams), ctypes.c_uint64]
         self.dll.ssd_create.restype = ctypes.c_void_p
 
@@ -108,7 +108,7 @@ class SSDCoreDLL:
         ]
         self.dll.ssd_get_kappa_row.restype = ctypes.c_int32
 
-        # New utility bindings
+        # Utility
         self.dll.ssd_get_params.argtypes = [ctypes.c_void_p, ctypes.POINTER(SSDParams)]
         self.dll.ssd_get_params.restype = None
         self.dll.ssd_set_params.argtypes = [ctypes.c_void_p, ctypes.POINTER(SSDParams)]
@@ -154,12 +154,12 @@ class SSDCoreDLL:
 
 @dataclass
 class SSDLLMConfig:
-    model_name: str = "microsoft/DialoGPT-medium"  # 軽量モデルでテスト
+    model_name: str = "microsoft/DialoGPT-medium"
     ssd_nodes: int = 8
     max_tokens: int = 128
-    device: str = "auto"          # 'cuda' / 'cpu' / 'mps'
+    device: str = "auto"          # 'cuda' / 'cpu'
     ssd_dll_path: str = "./ssd_align_leap.dll"
-    dtype_preference: str = "auto"  # "auto" / "fp16" / "fp32"
+    dtype_preference: str = "auto"  # "auto" / "bf16" / "fp16" / "fp32"
 
 
 # =============================================================================
@@ -171,39 +171,49 @@ class SSDEnhancedLLM:
         self.config = config
 
         print(f"[SSD-LLM] Loading model: {config.model_name}")
-        self.tokenizer = AutoTokenizer.from_pretrained(config.model_name)
+
+        # ---- Device / dtype ----
+        use_cuda = torch.cuda.is_available()
+        self.device = torch.device("cuda:0" if use_cuda and config.device != "cpu" else "cpu")
+
+        pref = (getattr(config, "dtype_preference", "auto") or "auto").lower()
+        if self.device.type == "cuda":
+            if pref in ("bf16", "auto"):
+                torch_dtype = torch.bfloat16
+            elif pref == "fp16":
+                torch_dtype = torch.float16
+            else:
+                torch_dtype = torch.float32
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+        else:
+            torch_dtype = torch.float32
+
+        # ---- Tokenizer ----
+        self.tokenizer = AutoTokenizer.from_pretrained(config.model_name, use_fast=False)
         if self.tokenizer.pad_token is None:
-            # 一部モデル（DialoGPTなど）は pad_token 未定義
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
-        use_cuda = torch.cuda.is_available()
-        if config.dtype_preference == "fp32":
-            torch_dtype = torch.float32
-        elif config.dtype_preference == "fp16":
-            torch_dtype = torch.float16 if use_cuda else torch.float32
-        else:  # auto
-            torch_dtype = torch.float16 if use_cuda else torch.float32
-
-        device_map = "auto" if use_cuda and config.device in ("auto", "cuda") else None
-
+        # ---- Model (単一デバイスへ明示配置) ----
+        trust_remote = any(k in config.model_name.lower() for k in ["qwen", "mistral", "llama"])
         self.model = AutoModelForCausalLM.from_pretrained(
             config.model_name,
-            torch_dtype=torch_dtype,
-            device_map=device_map,
-            trust_remote_code=False
+            dtype=torch_dtype,
+            trust_remote_code=trust_remote,
+            use_safetensors=True,
+            device_map=None,
         )
-        if device_map is None:
-            # CPU / 単一デバイス
-            target_device = "cuda" if (use_cuda and config.device == "cuda") else "cpu"
-            self.model.to(target_device)
+        self.model.to(self.device)
+        self.model.eval()
 
+        # ---- SSD Core ----
         print("[SSD-LLM] Initializing SSD core...")
         self.ssd_dll = SSDCoreDLL(config.ssd_dll_path)
         self.ssd_params = self.ssd_dll.create_default_params()
         self.ssd_handle = self.ssd_dll.dll.ssd_create(
             config.ssd_nodes,
             ctypes.byref(self.ssd_params),
-            123456789
+            123456789,  # seed
         )
         if not self.ssd_handle:
             raise RuntimeError("Failed to create SSD instance (ssd_create returned null).")
@@ -268,7 +278,7 @@ class SSDEnhancedLLM:
     # Core Generation
     # -------------------------------
     def generate_response(self, user_input: str, context: Optional[str] = None, dt: float = 1.0) -> Dict[str, Any]:
-        if not self.ssd_handle:
+        if not getattr(self, "ssd_handle", None):
             raise RuntimeError("SSD handle not initialized.")
 
         start_time = time.time()
@@ -299,16 +309,21 @@ class SSDEnhancedLLM:
         system_prompt = strategy['system_prompt']
         full_prompt = f"{system_prompt}\n\nユーザー: {user_input}\nAI:"
 
-        inputs = self.tokenizer(full_prompt, return_tensors="pt").to(self.model.device)
+        # >>> 正しいインデント（関数スコープ内）
+        inputs = self.tokenizer(full_prompt, return_tensors="pt", add_special_tokens=False).to(self.device)
 
         with torch.no_grad():
             outputs = self.model.generate(
                 **inputs,
                 max_new_tokens=self.config.max_tokens,
-                temperature=dynamic_temp,
-                top_p=strategy['top_p'],
+                min_new_tokens=min(48, self.config.max_tokens // 2),
+                temperature=max(0.7, dynamic_temp),
+                top_p=0.9,
                 do_sample=True,
-                pad_token_id=self.tokenizer.eos_token_id
+                repetition_penalty=1.1,
+                no_repeat_ngram_size=3,
+                pad_token_id=self.tokenizer.eos_token_id,
+                use_cache=True
             )
 
         reply = self.tokenizer.decode(
@@ -320,10 +335,7 @@ class SSDEnhancedLLM:
 
         # Jump probability (reconstruct)
         p_jump = 1.0 - float(np.exp(-telemetry.h * dt)) if telemetry.h >= 0 else 0.0
-        if p_jump > 1.0:
-            p_jump = 1.0
-        elif p_jump < 0.0:
-            p_jump = 0.0
+        p_jump = max(0.0, min(1.0, p_jump))
 
         ssd_meta = {
             'mode_used': 'leap' if telemetry.did_jump else 'alignment',
@@ -366,15 +378,13 @@ class SSDEnhancedLLM:
     # Kappa Matrix
     # -------------------------------
     def get_kappa_matrix(self) -> np.ndarray:
-        if not self.ssd_handle:
+        if not getattr(self, "ssd_handle", None):
             raise RuntimeError("SSD not initialized.")
-        N = self.ssd_dll.dll.ssd_get_N(self.ssd_handle)
+        N = self.ssd_dll.dll.ssd_get_N(self.ssd_handle) or self.config.ssd_nodes
         mat = np.zeros((N, N))
         row_buf = (ctypes.c_double * N)()
         for i in range(N):
-            count = self.ssd_dll.dll.ssd_get_kappa_row(
-                self.ssd_handle, i, row_buf, N
-            )
+            count = self.ssd_dll.dll.ssd_get_kappa_row(self.ssd_handle, i, row_buf, N)
             if count > 0:
                 mat[i, :count] = [row_buf[j] for j in range(count)]
         return mat
@@ -383,14 +393,14 @@ class SSDEnhancedLLM:
     # Parameter Ops
     # -------------------------------
     def fetch_ssd_params(self) -> SSDParams:
-        if not self.ssd_handle:
+        if not getattr(self, "ssd_handle", None):
             raise RuntimeError("SSD not initialized.")
         params_copy = SSDParams()
         self.ssd_dll.dll.ssd_get_params(self.ssd_handle, ctypes.byref(params_copy))
         return params_copy
 
     def apply_ssd_params(self):
-        if not self.ssd_handle:
+        if not getattr(self, "ssd_handle", None):
             raise RuntimeError("SSD not initialized.")
         self.ssd_dll.dll.ssd_set_params(self.ssd_handle, ctypes.byref(self.ssd_params))
 
@@ -413,6 +423,43 @@ class SSDEnhancedLLM:
             stype = m['strategy_type']
             dist[stype] = dist.get(stype, 0) + 1
         return dist
+
+    # -------------------------------
+    # Streaming Response Generation
+    # -------------------------------
+    def generate_response_stream(self, user_input: str, context: Optional[str] = None, dt: float = 1.0):
+        meaning_pressure = self.analyze_meaning_pressure(user_input, context)
+        telemetry = SSDTelemetry()
+        self.ssd_dll.dll.ssd_step(self.ssd_handle, ctypes.c_double(meaning_pressure), ctypes.c_double(dt), ctypes.byref(telemetry))
+        node = int(telemetry.current) % self.config.ssd_nodes
+        strategy = self.response_strategies.get(node, self.response_strategies[0])
+        dynamic_temp = strategy['temperature']
+        if telemetry.did_jump:
+            dynamic_temp = min(dynamic_temp + 0.3, 1.0)
+        if telemetry.align_eff > 0.8:
+            dynamic_temp = max(dynamic_temp - 0.2, 0.1)
+        full_prompt = f"{strategy['system_prompt']}\n\nユーザー: {user_input}\nAI:"
+
+        inputs = self.tokenizer(full_prompt, return_tensors="pt", add_special_tokens=False).to(self.device)
+
+        streamer = TextIteratorStreamer(self.tokenizer, skip_prompt=True, skip_special_tokens=True)
+        gen_kwargs = dict(
+            **inputs,
+            max_new_tokens=self.config.max_tokens,
+            min_new_tokens=8,
+            temperature=max(0.7, dynamic_temp),
+            top_p=0.9,
+            do_sample=True,
+            repetition_penalty=1.1,
+            no_repeat_ngram_size=3,
+            pad_token_id=self.tokenizer.eos_token_id,
+            use_cache=True,
+            streamer=streamer
+        )
+        Thread(target=self.model.generate, kwargs=gen_kwargs, daemon=True).start()
+
+        for text in streamer:
+            yield text
 
     def get_ssd_status(self) -> Dict[str, Any]:
         if not self.ssd_metrics_history:
@@ -475,7 +522,8 @@ def main():
         model_name="microsoft/DialoGPT-medium",
         ssd_nodes=8,
         max_tokens=96,
-        device="auto"
+        device="auto",
+        dtype_preference="bf16"
     )
     engine = SSDEnhancedLLM(config)
 
@@ -491,7 +539,7 @@ def main():
         meta = result['ssd_metadata']
         print(f"\n--- Turn {i} ---")
         print("User:", text)
-        print(f"AI [{meta['strategy_type']}]: {result['response']}")
+        print(f"AI [{meta['strategy_type']}]: {result['response'][:200]}")
         print(f"  Node={meta['current_node']} Mode={meta['mode_used']} Heat={meta['heat_level']:.3f} "
               f"JumpProb={meta['jump_probability']:.3f} Jump={meta['did_jump']}")
 
